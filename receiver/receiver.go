@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"os/signal"
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"menteslibres.net/gosexy/yaml"
@@ -20,6 +23,23 @@ import (
 func main() {
 	var wg sync.WaitGroup
 	wg.Add(1)
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		caughtSignalTimes := 0
+
+		for {
+			sig := <-sigs
+			fmt.Println()
+			fmt.Printf("CAUGHT SIGNAL: %v\n", sig)
+			caughtSignalTimes++
+			if caughtSignalTimes > 1 {
+				wg.Done()
+			}
+		}
+	}()
 
 	settings, err := yaml.Open("config.yml")
 	if err != nil {
