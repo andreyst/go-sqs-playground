@@ -21,25 +21,7 @@ import (
 )
 
 func main() {
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		caughtSignalTimes := 0
-
-		for {
-			sig := <-sigs
-			fmt.Println()
-			fmt.Printf("CAUGHT SIGNAL: %v\n", sig)
-			caughtSignalTimes++
-			if caughtSignalTimes > 1 {
-				wg.Done()
-			}
-		}
-	}()
+	wg := new(sync.WaitGroup)
 
 	settings, err := yaml.Open("config.yml")
 	if err != nil {
@@ -49,13 +31,53 @@ func main() {
 
 	svc := createSvc()
 
-	err2 := launchLoops(settings, svc)
+	shutdownChans, err2 := launchLoops(wg, settings, svc)
 	if err2 != nil {
 		log.Fatalf(err2.Error())
 		return
 	}
 
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	go signalProcessor(shutdownChans, sigs, wg)
+
 	wg.Wait()
+}
+
+func signalProcessor(shutdownChans []chan *sync.WaitGroup, sigs chan os.Signal, wg *sync.WaitGroup) {
+	repeatTimeout := 10 * time.Second
+	caughtSignalTimes := 0
+	prevSignalCaughtAt, _ := time.Parse("2006-Jan-02", "0001-Jan-01")
+
+	for {
+		<-sigs
+
+		fmt.Println()
+
+		if time.Since(prevSignalCaughtAt) > repeatTimeout {
+			caughtSignalTimes = 0
+		}
+
+		caughtSignalTimes++
+		if caughtSignalTimes > 1 {
+			fmt.Println("Aborting")
+			for i := 1; i <= len(shutdownChans); i++ {
+				wg.Done()
+			}
+			return
+		}
+
+		fmt.Printf("Shutting down gracefully, repeat signal in %v to abort...\n", repeatTimeout)
+		for _, shutdownChan := range shutdownChans {
+			select {
+			case shutdownChan <- wg:
+			default:
+			}
+		}
+
+		prevSignalCaughtAt = time.Now()
+	}
 }
 
 func createSvc() (service *sqs.SQS) {
@@ -64,27 +86,45 @@ func createSvc() (service *sqs.SQS) {
 	return svc
 }
 
-func launchLoops(settings *yaml.Yaml, svc *sqs.SQS) error {
+func launchLoops(wg *sync.WaitGroup, settings *yaml.Yaml, svc *sqs.SQS) (chans []chan *sync.WaitGroup, err error) {
 	queues := settings.Get("queues")
 
 	queuesType := reflect.TypeOf(queues).Kind()
 	if queuesType != reflect.Slice {
-		return fmt.Errorf("Queues config entry should be an array of strings, it is %v", queuesType)
+		return nil, fmt.Errorf("Queues config entry should be an array of strings, it is %v", queuesType)
 	}
 
-	for _, queue := range queues.([]interface{}) {
-		queueType := reflect.TypeOf(queue).Kind()
+	var queueNames []string
+	var shutdownChans []chan *sync.WaitGroup
+
+	for _, queueName := range queues.([]interface{}) {
+		queueType := reflect.TypeOf(queueName).Kind()
 		if queueType != reflect.String {
-			return fmt.Errorf("Queue entry should be a string, it is %v", queueType)
+			return nil, fmt.Errorf("Queue entry should be a string, it is %v", queueType)
 		}
-		go receiveMessageLoop(svc, queue.(string))
+
+		queueNames = append(queueNames, queueName.(string))
 	}
 
-	return nil
+	for _, queueName := range queueNames {
+		shutdownChan := make(chan *sync.WaitGroup, 1)
+		shutdownChans = append(shutdownChans, shutdownChan)
+		go receiveMessageLoop(shutdownChan, svc, queueName)
+		wg.Add(1)
+	}
+
+	return shutdownChans, nil
 }
 
-func receiveMessageLoop(svc *sqs.SQS, queueName string) {
+func receiveMessageLoop(shutdownChan chan *sync.WaitGroup, svc *sqs.SQS, queueName string) {
 	for {
+		select {
+		case wg := <-shutdownChan:
+			log.Println("[" + queueName + "] Got shutdown signal from chan, shutting down")
+			wg.Done()
+			return
+		default:
+		}
 		processMessage(svc, queueName)
 	}
 }
